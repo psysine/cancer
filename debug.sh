@@ -1,2 +1,2 @@
 #!/bin/sh
-g++ -ggdb -Wall sol.cc -o sol
+g++ -ggdb -Wall cancer.cc -o cancer

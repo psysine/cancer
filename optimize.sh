@@ -1,2 +1,2 @@
 #!/bin/sh
-g++ -O3 -Wall sol.cc -o sol
+g++ -O3 -Wall cancer.cc -o cancer
