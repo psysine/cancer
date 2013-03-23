@@ -24,10 +24,25 @@ typedef unsigned long long ull;
 typedef long long ll;
 //typedef pair<int,int> pii;
 
+int sumi(int *a, int n) {
+  int sum = 0;
+  rep(i,n) sum += a[i];
+  return sum;
+  }
+double sumd(double *a, int n) {
+  double sum = 0;
+  rep(i,n) sum += a[i];
+  return sum;
+  }
+
 string fname, region;
 const int maxreads = 100000;
 
 double phred2prob[255];
+
+int prob2phred(double prob) {
+  return lrint(-10*log10(prob));
+  }
 
 void precompute() { //called from main
   rep(i,255) phred2prob[i] = pow(10,-i/10.);
@@ -45,7 +60,9 @@ void init(string cmd, string fname, string region, int *nfiles, vector<FILE*> *f
     char *bamfile = 0;
     if(fscanf(fi, "%as", &bamfile) != 1)
       error(1, 0, "Not enough filenames");
-    FILE *file = popen((string(samtools)+" "+cmd+" -r "+region+" \""+bamfile+'"').c_str(), "r");
+    if(region != "all")
+      cmd += " -r " + region;
+    FILE *file = popen((string(samtools)+" "+cmd+" \""+bamfile+'"').c_str(), "r");
     if(file <= 0)
       error(1, errno, "Can't run samtools");
     files->push_back(file);
@@ -90,17 +107,28 @@ void findcover(int argc, char **argv) {
     }
   }
 
-
 //for parsing mpilup output:
+char *chrs[22] = {"chr1","chr2","chr3","chr4","chr5","chr6","chr7","chr8","chr9",
+                  "chr10","chr11","chr12","chr13","chr14","chr15","chr16","chr17",
+                  "chr18","chr19","chr20","chr21","chr22"};
+int lastchr = 0; //for performance, to avoid calling strcmp too many times
+int chrtoi(const char *c) {
+  if(!strcmp(c, chrs[lastchr])) return lastchr;
+  rep(i, 22) if(!strcmp(c, chrs[i])) return lastchr = i;
+  return -1;
+  }
+
 struct parsebase_state {
-  int nfiles, p;
-  vector<int> poss;
+  int nfiles, c, p;
+  vector<int> chrs, poss, nreads;
   char **reads1, **quals1;
   vector<FILE*> files;
   };
 void parsebase_init(parsebase_state *s, int nfiles, vector<FILE*> files) {
-  s->p = 0;
+  s->c = INT_MAX, s->p = INT_MAX;
+  s->chrs.resize(nfiles, -1); //last read chromosome
   s->poss.resize(nfiles, 0); //last read position
+  s->nreads.resize(nfiles); //alleged number of reads
   s->nfiles = nfiles;
   s->reads1 = new char *[nfiles];
   rep(f, nfiles) s->reads1[f] = new char [maxreads];
@@ -114,170 +142,230 @@ void parsebase_clear(parsebase_state *s) {
   rep(f, s->nfiles) delete[] s->quals1[f];
   delete[] s->quals1;
   }
+void parsebase_parse(const char *reads1, const char *quals1, int nreads, int *atgc, int *atgc_r, int *reads, int *quals, int *nreads2) {
+  rep(j,4) atgc[j] = atgc_r[j] = 0;
+  int i = 0;
+  int slen = strlen(reads1), num_asterisk = 0;
+  rep(k, slen) { //convert mpileup output into numerical data
+    int indel_len;
+    switch(reads1[k]) {
+      case 'a': atgc_r[0]++;
+      case 'A': reads[i] = 0, atgc[0]++, quals[i] = quals1[i]-33, i++;
+      break;
+      case 't': atgc_r[1]++;
+      case 'T': reads[i] = 1, atgc[1]++, quals[i] = quals1[i]-33, i++;
+      break;
+      case 'g': atgc_r[2]++;
+      case 'G': reads[i] = 2, atgc[2]++, quals[i] = quals1[i]-33, i++;
+      break;
+      case 'c': atgc_r[3]++;
+      case 'C': reads[i] = 3, atgc[3]++, quals[i] = quals1[i]-33, i++;
+      break;
+      case '^': k++; //ignore mapping quality
+      break;
+      case '+': case '-': indel_len = atoi(reads1+k+1), k++; //we ignore indels
+	while(isdigit(reads1[k])) k++;
+	k += indel_len - 1; //the -1 is because the for loop will increase it by 1
+      break; 
+      case '$': break;
+      case '*': nreads--, num_asterisk++;
+      break;
+      default: printf("WARNING: strange character \'%c\'\n", reads1[k]), exit(1);
+      }
+    }
+  *nreads2 = nreads;
+  if(nreads != i)
+    printf("WARNING: nreads != i"), *(int*)0=0, exit(1);
+  if(reads1[slen] != 0 || quals1[i+num_asterisk] != 0) //DELETE THIS LATER
+    printf("reads1[nreads+1]!= 0||quals1[i]!=0"), exit(1);
+  }
+void parsebase_read(FILE *fi, int *pos, int *chr, int *nreads, char *reads, char *quals) 
+  { // read lines from mplieup input until we get one from an interesting chromosome or until there is no more input
+    // interesting chromosomes are specified in char *chrs[] above
+  assert(maxreads == 100000);
+  char c[1000];
+  *chr = -1;
+  while(*chr == -1) {
+    if(fscanf(fi, "%999s %d %*s %d", c, pos, nreads) != 3)
+      *chr = *pos = INT_MAX, *nreads = 0;
+    else {
+      *chr = chrtoi(c); //somewhat inefficient
+      if(*nreads > 0) {
+	if(fscanf(fi, "%99999s %99999s%*[^\n]%*c", reads, quals) != 2) {
+	  assert(0); // (it shouldn't be possible to end up here)
+	  *chr = *pos = INT_MAX, *nreads = 0; //but this is what we'd to if it were
+	  }
+	}
+      else reads[0] = 0, quals[0] = 0, fscanf(fi, "%*[^\n]%*c");
+      }
+    }
+  }
 bool parsebase_get(parsebase_state *s,
                    int atgc[][4], //counts of A/T/G/C
                    int atgc_r[][4], //counts of A/T/G/C only in reverse strand
                    int reads[][maxreads],
                    int quals[][maxreads],
                    int nreads[],
+                   int *chr, //chromosome read
                    int *pos //position read
                    ) { //returns 1 if successful
-  s->p++;
-  rep(f, s->nfiles) {
-    if(s->poss[f] < s->p) {
-      if(fscanf(s->files[f], "%*s %d %*s %d", &s->poss[f], nreads+f) != 2)
-        s->poss[f] = INT_MAX;
-      else {
-	if(nreads[f] > 0) {
-	  if(fscanf(s->files[f], "%99999s %99999s%*[^\n]%*c", s->reads1[f], s->quals1[f]) != 2) {
-	    s->poss[f] = INT_MAX;
-	    assert(0); //remove later (it shouldn't be possible to end up here)
-	    }
-	  }
-	else s->reads1[f][0] = 0, s->quals1[f][0] = 0, fscanf(s->files[f], "%*[^\n]%*c");
-	}
-      }
-    }
+  rep(f, s->nfiles)
+    if(s->chrs[f] < s->c || s->chrs[f] == s->c && s->poss[f] < s->p)
+      parsebase_read(s->files[f], &s->poss[f], &s->chrs[f], &s->nreads[f], s->reads1[f], s->quals1[f]);
+
+//if the minimum of the chrs is c and (the minimun of the poss for which the chr is c) is p
+//  do parsing for c,p, then increment p
+//if the minimum of the chrs is INT_MAX
+//  return 0
+
+  //check which chromosome to focus on
+  s->c = INT_MAX;
+  rep(f, s->nfiles) if(s->chrs[f] < s->c) s->c = s->chrs[f];
+  if(s->c == INT_MAX) return 0;
+
+  //check which position to focus on
   s->p = INT_MAX;
-  //check which position to focus on in this iteration of the outer loop
-  rep(f, s->nfiles) if(s->poss[f] < s->p) s->p = s->poss[f];
-  if(s->p == INT_MAX) return 0;
+  rep(f, s->nfiles) if(s->chrs[f] == s->c && s->poss[f] < s->p) s->p = s->poss[f];
+  assert(s->p != INT_MAX);
 
-  *pos = s->p;
+  *chr = s->c, *pos = s->p;
 
   rep(f, s->nfiles) {
-    assert(s->p <= s->poss[f]); //remove later
-    rep(j,4) atgc[f][j] = atgc_r[f][j] = 0;
-    int i = 0;
-    int slen = strlen(s->reads1[f]), num_asterisk = 0;
-    rep(k, slen) { //convert mpileup output into numerical data
-      int indel_len;
-      switch(s->reads1[f][k]) {
-	case 'a': atgc_r[f][0]++;
-	case 'A': reads[f][i] = 0, atgc[f][0]++, quals[f][i] = s->quals1[f][i]-33, i++;
-	break;
-	case 't': atgc_r[f][1]++;
-	case 'T': reads[f][i] = 1, atgc[f][1]++, quals[f][i] = s->quals1[f][i]-33, i++;
-	break;
-	case 'g': atgc_r[f][2]++;
-	case 'G': reads[f][i] = 2, atgc[f][2]++, quals[f][i] = s->quals1[f][i]-33, i++;
-	break;
-	case 'c': atgc_r[f][3]++;
-	case 'C': reads[f][i] = 3, atgc[f][3]++, quals[f][i] = s->quals1[f][i]-33, i++;
-	break;
-	case '^': k++; //ignore mapping quality
-	break;
-	case '+': case '-': indel_len = atoi(s->reads1[f]+k+1), k++; //we ignore indels
-	  while(isdigit(s->reads1[f][k])) k++;
-	  k += indel_len - 1; //the -1 is because the for loop will increase it by 1
-	break; 
-	case '$': break;
-	case '*': nreads[f]--, num_asterisk++;
-	break;
-	default: printf("WARNING: strange character \'%c\': p: %d, f: %d\n", s->reads1[f][k], s->p, f), exit(1);
-	}
+    assert(s->p <= s->poss[f] && s->c <= s->chrs[f]);
+    if(s->chrs[f] == *chr && s->poss[f] == *pos)
+      parsebase_parse(s->reads1[f], s->quals1[f], s->nreads[f], atgc[f], atgc_r[f], reads[f], quals[f], nreads+f);
+    else {
+      rep(i,4) atgc[f][i] = atgc_r[f][i] = 0;
+      nreads[f] = 0;
       }
-
-    if(nreads[f] != i) printf("WARNING: nreads[f] != i: p: %d, f: %d\n", s->p, f), exit(1);
-    if(s->reads1[f][slen] != 0 || s->quals1[f][i+num_asterisk] != 0) //DELETE THIS LATER
-      printf("reads1[f][nreads+1]!= 0||quals1[f][i]!=0, pos: %d, file: %d\n", s->p, f);
+    assert(sumi(atgc[f], 4) == nreads[f]);
     }
+  s->p++;
   return 1;
   }
 
-//a normal distribution is represented by a double[2], first mean, then variance
-int ncmp(const void *a, const void *b) { //compare means of normals's (for sorting, in ascending order, that's why things are upside-down, see man qsort)
-  const double *aa = (const double *) a, *bb = (const double *) b;
-  if(aa[0] > bb[0]) return -1;
-  return aa[0] < bb[0];
-  }
-double dist(double a[2], double b[2]) {return fabs(a[0]-b[0]) + 0/*fabs(a[1]-b[1])*/;} //CHANGE THIS
-double dist3(double a[3][2], double b[3][2]) {double d = 0; rep(i,3) d += dist(a[i], b[i]); return d;}
+const double max_ratio = 1.1; //maximum allowed (biggest belonging to bin)/(smallest belonging to bin)
+int maxcount[4] = {15000, 200, 50, 10};
+int dims[5];
+const int maxc = 20000;
+int count2bin[maxc];
+int nquals = 60;
+struct postype {
+  double sums[5];
+  int count;
+  };
+postype ***counts;
+int totsize;
 
-void dostuff(int argc, char **argv) {
-  if(argc != 1) printf("Usage: dostuff <args to mpileup>\n"), exit(1);
+int dimcoefs[4];
+void initdimcoefs() { //called from abg_init
+  dimcoefs[3] = dims[4];
+  dimcoefs[2] = dimcoefs[3]*dims[3];
+  dimcoefs[1] = dimcoefs[2]*dims[2];
+  dimcoefs[0] = dimcoefs[1]*dims[1];
+  }
+int ind(int a[5]) {
+  return a[0]*dimcoefs[0] + a[1]*dimcoefs[1] + a[2]*dimcoefs[2] + a[3]*dimcoefs[3] + a[4];
+  }
+
+
+void abg_init(int nfiles) {
+  count2bin[0] = 0;
+  count2bin[1] = 1;
+  int current_bin = 1;
+  int lastbinmin = 1;
+  for(int i = 2; i < maxc; i++)  {
+    if(double(i)/lastbinmin > max_ratio)
+      current_bin++, lastbinmin = i;
+    count2bin[i] = current_bin;
+    }
+  int maxbin[4];
+  for(int d = 0; d < 4; d++) {
+   maxbin[d] = count2bin[maxcount[d]];
+   rep(i, maxc) if(count2bin[i] == maxbin[d]) maxcount[d] = i; //adjust maxcount
+   dims[d] = maxbin[d] + 1;
+   }
+  dims[4] = nquals;
+  totsize = 1;
+  rep(d, 5) totsize *= dims[d];
+  rep(d, 5) fprintf(stderr, "dims[%d] = %d\n", d, dims[d]);
+  const int ptrsize = sizeof(int32_t*);
+  initdimcoefs();
+  counts = new postype**[nfiles];
+  rep(f, nfiles) {
+    counts[f] = new postype*[totsize];
+    memset(counts[f], 0, ptrsize*totsize);
+    }
+  }
+
+void abg(int argc, char **argv) {
+  if(argc != 1) fprintf(stderr, "Usage: abg <args to mpileup>\n"
+"This function does some yet undefined stuff.\n"
+"If you don't want to give any extra arguments to mpileup, write '\"\"'\n"), exit(1);
   int nfiles;
   vector <FILE*> files;
   init(string("mpileup ")+argv[0], fname, region, &nfiles, &files);
-
-  //things related to clustering:
-  //reference: http://www.cs.princeton.edu/courses/archive/fall08/cos436/Duda/C/sk_means.htm
-  const int maxclusters = 300;
-  const double thres = 0.1;
-  double means[nfiles][maxclusters][3][2]; //store the three nucleotides that we have the most of, sorted by how much we have
-  int counts[nfiles][maxclusters];
-  int nclusters[nfiles];
-  mset(nclusters, 0);
-
-  //progress printing:
-  int every_n_pos = 100000;
-  int next_pos_to_print = 100000;
-
+  abg_init(nfiles);
   parsebase_state s;
   parsebase_init(&s, nfiles, files);
-  int atgc[nfiles][4];
-  int atgc_r[nfiles][4];
-  int reads[nfiles][maxreads];
-  int quals[nfiles][maxreads];
-  int nreads[nfiles];
-  int pos;
-  while(parsebase_get(&s, atgc, atgc_r, reads, quals, nreads, &pos)) {
+  int atgc[nfiles][4], atgc_r[nfiles][4], reads[nfiles][maxreads], quals[nfiles][maxreads], nreads[nfiles], chr, pos;
+  while(parsebase_get(&s, atgc, atgc_r, reads, quals, nreads, &chr, &pos)) {
+    if(! (pos % 100000)) fprintf(stderr, "chr: %d, pos: %d\n", chr, pos);
     rep(f, nfiles) {
-      //approximate variance for atgc
-      double natgc[4][2]; //approximate prior normal distribution of amount of dna
-      rep(i, 4) natgc[i][0] = natgc[i][1] = atgc[f][i];
-      rep(i, nreads[f]) rep(j, 4) {
-	double errprob = phred2prob[quals[f][i]];
-	natgc[j][1] += reads[f][i] == j ? errprob : errprob/2; //heuristic
-	}
-
-      //sort normal dists by mean
-      qsort(natgc, 4, 2*sizeof(double), ncmp);
-
-      //might be better to cluster the logarighms of the parameters
-      rep(i, 3) rep(j, 2) natgc[i][j] = log(natgc[i][j]+10);
-
-      //do clustering
-      if(!nclusters[f]) {
-        memcpy(means[f][0], natgc, 3*2*sizeof(double));
-        counts[f][0] = 1;
-        nclusters[f]++;
-        }
-      else {
-	int closest = 0;
-	double mindist = 1e100;
-	rep(i, nclusters[f]) {
-          double d = dist3(means[f][i], natgc);
-          if(d < mindist) closest = i, mindist = d;
-          }
-        if(mindist > thres) {
-	  memcpy(means[f][nclusters[f]], natgc, 3*2*sizeof(double));
-	  counts[f][nclusters[f]] = 1;
-	  nclusters[f]++;
+      double avgqual = 0;
+      rep(r, nreads[f]) avgqual += phred2prob[quals[f][r]];
+      avgqual /= nreads[f];
+      int qual = prob2phred(avgqual);
+      rep(i, 4) for(int j = i+1; j < 4; j++) if(atgc[f][j] > atgc[f][i]) swap(atgc[f][j], atgc[f][i]);
+      assert(atgc[f][0] >= atgc[f][1] && atgc[f][1] >= atgc[f][2] && atgc[f][2] >= atgc[f][3]);
+      assert(atgc[f][0] < maxc);
+      int bins[5];
+      rep(i, 4) bins[i] = count2bin[atgc[f][i]];
+      bins[4] = qual;
+      int depth = sumi(atgc[f], 4);
+      if(depth >= 3 && qual >= 5) {
+        if(counts[f][ind(bins)]) {
+          postype *ppt = counts[f][ind(bins)];
+          rep(i, 4) ppt->sums[i] += atgc[f][i];
+          ppt->sums[4] += avgqual;
+          ppt->count++;
           }
         else {
-          double c = ++counts[f][closest];
-          rep(i,3) rep(j,2) means[f][closest][i][j] = (1-1/c)*means[f][closest][i][j] + 1/c*natgc[i][j];
+          postype *ppt = new postype;
+          rep(i, 4) ppt->sums[i] = atgc[f][i];
+          ppt->sums[4] = avgqual;
+          ppt->count = 1;
+          counts[f][ind(bins)] = ppt;
           }
         }
-      if(nclusters[f] == maxclusters) {
-        rep(c, nclusters[f]) {
-          printf("%03d  %6d", f, counts[f][c]);
-          rep(i, 3) rep(j, 2) printf("  %9.3f", exp(means[f][c][i][j])-10);
-          printf("\n");
-          }
-        nclusters[f] = 0;
-        }
-      }
-    //print progress:
-    if(pos > next_pos_to_print) {
-      next_pos_to_print += every_n_pos;
-      fprintf(stderr, "pos: %d\n", pos);
-      rep(f, nfiles) fprintf(stderr, "%03d, %6d clusters\n", f, nclusters[f]);
-      fprintf(stderr, "\n");
       }
     }
-  rep(f, nfiles) fprintf(stderr, "%03d, %8d clusters\n", f, nclusters[f]);
+  rep(f, nfiles) {
+    int i[5] = {0}, mins[5], maxs[5], nnonzero = 0;
+    rep(d, 5) mins[d] = INT_MAX, maxs[d] = INT_MIN;
+    for(i[0] = 0; i[0] < dims[0]; i[0]++)
+      for(i[1] = 0; i[1] < dims[1]; i[1]++)
+	for(i[2] = 0; i[2] < dims[2]; i[2]++)
+	  for(i[3] = 0; i[3] < dims[3]; i[3]++)
+	    for(i[4] = 0; i[4] < dims[4]; i[4]++) {
+	      if(counts[f][ind(i)]) {
+                nnonzero++;
+                rep(d, 5) {
+                  if(i[d] < mins[d]) mins[d] = i[d];
+                  if(i[d] > maxs[d]) maxs[d] = i[d];
+                  }
+                postype *ppt = counts[f][ind(i)];
+                if(nfiles > 1) printf("%5d ", f);
+                printf("%10d", ppt->count);
+                rep(j, 5) printf(" %10f", ppt->sums[j]/ppt->count);
+                printf("\n");
+                }
+	      }
+    fprintf(stderr, "file: %d\n", f);
+    rep(d, 5)
+      fprintf(stderr, "dim %d: min=%d, max=%d\n", d, mins[d], maxs[d]);
+    fprintf(stderr, "total nonzero: %d\n", nnonzero);
+    } 
   parsebase_clear(&s);
   }
 
@@ -290,9 +378,9 @@ void compare(int argc, char **argv) {
   init(string("mpileup ")+argv[0], fname, region, &nfiles, &files);
   parsebase_state s;
   parsebase_init(&s, nfiles, files);
-  int atgc[nfiles][4], atgc_r[nfiles][4], reads[nfiles][maxreads], quals[nfiles][maxreads], nreads[nfiles], pos;
-  while(parsebase_get(&s, atgc, atgc_r, reads, quals, nreads, &pos)) {
-    printf("Position %d:\n", pos);
+  int atgc[nfiles][4], atgc_r[nfiles][4], reads[nfiles][maxreads], quals[nfiles][maxreads], nreads[nfiles], chr, pos;
+  while(parsebase_get(&s, atgc, atgc_r, reads, quals, nreads, &chr, &pos)) {
+    printf("chr %d, pos %d:\n", chr, pos);
     rep(f, nfiles) {
       printf("%03d ", f);
       rep(i, 4)
@@ -303,163 +391,9 @@ void compare(int argc, char **argv) {
   parsebase_clear(&s);
   }
 
-const double cutoff = 0.99, //only print if the probability of the most likely genotype is less than this or if genotype is heterozygous
-             a = 0.01; //prior prob. of heterozygosity
-
-void genotype(int, char**) {
-  error(1, 0, "genotype is temporarilty unavailable, because of rewriting the code.");
-  }
-//some compilers complain if you store this big things on the stack
-//char reads1[maxfiles][maxreads];
-//char quals1[maxfiles][maxreads];
-//int atgc[maxfiles][4]; //TODO: think about weighting these based on read quality
-//int atgc_r[maxfiles][4]; //reverse read counts
-/*
-void genotype2(int argc, char **argv) {
-  if(argc != 3) printf("Usage: genotype <cutoff> <mindepth> \"<arguments to samtools>\"\n"
-"Positions where at least one sample has a pobability less than <cutoff> for all of AA, TT, GG or CC will be shown.\n"
-"Only samples where a postion is covered by at least <mindepth> reads will be used to determine if that position is interestin.\n"
-"If you don't want any to send any extra arguments to samtools, write \"\".\n"
-"The output is under development, please see the source code.\n"), exit(1);
-  init(string("mpileup ")+argv[2]);
-  double P_AB_X[maxfiles][10]; //P(AB|X)
-  precompute();
-  double cutoff = atof(argv[0]);
-  int mindepth = atoi(argv[1]);
-  int poss[maxfiles]; //last read position
-  mset(poss, 0);
-  bool end = 0; //remove?
-  int p = 0;
-  int nreads[maxfiles];
-  while(!end) {
-    bool interesting = 0;
-    p++;
-    rep(f, nfile) {
-      if(poss[f] < p) {
-        if(fscanf(files[f], "%*s %d %*s %d", poss+f, nreads+f) != 2)
-          poss[f] = INT_MAX;
-	else {
-          if(nreads > 0) {
-	    if(fscanf(files[f], "%99999s %99999s%*[^\n]%*c", reads1[f], quals1[f]) != 2) {
-	      poss[f] = INT_MAX;
-	      assert(0); //remove later (it shouldn't be possible to end up here)
-	      }
-	    }
-	  else reads1[f][0] = 0, quals1[f][0] = 0, fscanf(files[f], "%*[^\n]%*c");
-	  }
-        }
-      }
-    p = INT_MAX;
-    //check which position to focus on in this iteration of the outer loop
-    rep(f, nfile) if(poss[f] < p) p = poss[f];
-    if(p == INT_MAX) break;
-
-    rep(f, nfile) {
-      assert(p <= poss[f]); //remove later
-      rep(j,4) atgc[f][j] = atgc_r[f][j] = 0;
-      if(p < poss[f]) nreads[f] = 0;
-      int i = 0;
-      int reads[100000];
-      int quals[100000];
-      int slen = strlen(reads1[f]), num_asterisk = 0;
-      rep(k, slen) { //convert mpileup output into numerical data
-        int indel_len;
-	switch(reads1[f][k]) {
-	  case 'a': atgc_r[f][0]++;
-          case 'A': reads[i] = 0, atgc[f][0]++, quals[i] = quals1[f][i]-33, i++;
-	  break;
-	  case 't': atgc_r[f][1]++;
-          case 'T': reads[i] = 1, atgc[f][1]++, quals[i] = quals1[f][i]-33, i++;
-	  break;
-	  case 'g': atgc_r[f][2]++;
-          case 'G': reads[i] = 2, atgc[f][2]++, quals[i] = quals1[f][i]-33, i++;
-	  break;
-	  case 'c': atgc_r[f][3]++;
-          case 'C': reads[i] = 3, atgc[f][3]++, quals[i] = quals1[f][i]-33, i++;
-	  break;
-	  case '^': k++; //ignore mapping quality
-	  break;
-	  case '+': case '-': indel_len = atoi(reads1[f]+k+1), k++; //we ignore indels
-            while(isdigit(reads1[f][k])) k++;
-            k += indel_len - 1; //the -1 is because the for loop will increase it by 1
-	  break; 
-          case '$': break;
-          case '*': nreads[f]--, num_asterisk++;
-          break;
-          default: printf("WARNING: strange character \'%c\': p: %d, f: %d\n", reads1[f][k], p, f), exit(1);
-	  }
-	}
-
-      if(nreads[f] != i) printf("WARNING: nreads[f] != i: p: %d, f: %d\n", p, f), exit(1);
-      if(reads1[f][slen] != 0 || quals1[f][i+num_asterisk] != 0) //DELETE THIS LATER
-        printf("reads1[f][nreads+1]!= 0||quals1[f][i]!=0, pos: %d, file: %d\n", p, f);
-
-      //calculate genotype probabilities
-      //order: AA TT GG CC AT AG AC TG TC GC,  ATGC = 0123
-      int c[10][2] = {{0,0},{1,1},{2,2},{3,3},{0,1},{0,2},{0,3},{1,2},{1,3},{2,3}};
-      double l_P_AB[10]; //log(P(AB)), i.e prior prob. of the genotypes
-      double l_P_Xi_AB[3][255]; //log(P(Xi=xi|AB))
-      if(s->p < s->poss[f] || !nreads[f]) {
-	rep(i, 10) P_AB_X[f][i] = 0;
-	continue;
-	}
-      static int inited = 0;
-      if(!inited) {
-        rep(i,10) l_P_AB[i] = c[i][0]==c[i][1] ? log((1-a)/4) : log(a/6); //"a" is prior prob of heterozygosity
-        rep(j,255) l_P_Xi_AB[0][j] = log(phred2prob[j]/3);
-        rep(j,255) l_P_Xi_AB[1][j] = log(.5*(1-phred2prob[j]) + .5*phred2prob[j]/3);
-        rep(j,255) l_P_Xi_AB[2][j] = log(1-phred2prob[j]);
-        inited = 1;
-        }
-      double l_P_AB_X[10];
-      rep(i, 10) {
-	double l_P_X_AB = 0; //P(X|AB)
-	rep(k, nreads[f]) {
-	//P(Xi=xi|Yi=A) = P(Yi=A|Xi=xi)*P(Xi=xi)/P(Yi=A) = P(Yi=A|Xi=xi)*.25/.25 = P(Yi=A|Xi=xi)
-	//P(Xi=...) ........... (write down how to derive this stuff)
-          //this is the old way of computing this:
-	  //P_Xi_AB = .5*(reads[k]==c[i][0]?1-quals[k]:quals[k]/3) + .5*(reads[k]==c[i][1]?1-quals[k]:quals[k]/3);
-	  //l_P_X_AB += log(P_Xi_AB);
-          //this is the new way, using precomputed values:
-          int nsame = (reads[k]==c[i][0]) + (reads[k]==c[i][1]);
-          l_P_X_AB += l_P_Xi_AB[nsame][quals[k]];
-	  }
-	l_P_AB_X[i] = l_P_X_AB + l_P_AB[i];
-	}
-      double m = -1e100;
-      rep(i,10) if(l_P_AB_X[i] > m) m = l_P_AB_X[i];
-      rep(i,10) P_AB_X[f][i] = exp(l_P_AB_X[i] - m);
-      double denom = 0;
-      rep(i,10) denom += P_AB_X[f][i];
-      rep(i,10) P_AB_X[f][i] /= denom;
-
-      //check if interesting:
-      m = 0;
-      rep(i, 4) m = P_AB_X[f][i] > m ? P_AB_X[f][i] : m;
-      if(m < cutoff && nreads[f] >= mindepth) interesting = 1;
-      }
-
-    if(interesting) {
-      static bool first = 1; //(this way of doing it depends on this function only being called once)
-      if(first) first = 0;
-      else printf("\n");
-      printf("Position %d:\n", p);
-      rep(f, nfile) {
-        printf("%03d", f);
-        rep(i, 10) printf(" %7.5f", P_AB_X[f][i]);
-        rep(i, 4) printf("\t%d", atgc[f][i]);
-        printf("\t");
-        rep(i, 4) printf("\t%d", atgc_r[f][i]);
-        printf("\n");
-        }
-      }
-    }
-  }
-*/
-
 void usage(char **argv) {
   printf("Usage:\n%s <filename> <region> <command> [command options].\n"
-	 "Available commands: compare, findcover, genotype, dostuff.\n"
+	 "Available commands: compare, findcover, abg.\n"
          "<region> can be something like \"chr1\" to get one whole region, or something like \"chr1:123-234\" to get a certain range of positions within this region.\n"
 	 "The first line of the file with name filename contains the path of the samtools command.\n"
 	 "The second line contains an integer n specifying the number of files to be opened.\n"
@@ -479,9 +413,7 @@ int main(int argc, char **argv) {
     compare(argc, argv);
   else if(!strcmp(command, "findcover"))
     findcover(argc, argv);
-  else if(!strcmp(command, "genotype"))
-    genotype(argc, argv);
-  else if(!strcmp(command, "dostuff"))
-    dostuff(argc, argv);
+  else if(!strcmp(command, "abg"))
+    abg(argc, argv);
   else usage(argv); 
   }
