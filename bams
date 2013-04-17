@@ -1,8 +1,4 @@
 ~/samtools/samtools
-6
-../bam/Lilly-496.bam
-../bam/Lilly-497.bam
-../bam/Lilly-500.bam
-../bam/Lilly-501.bam
-../bam/Lilly-504.bam
-../bam/Lilly-505.bam
+2
+~/bams/Example-1.bam
+~/bams/Example-2.bam
