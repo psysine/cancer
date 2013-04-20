@@ -70,14 +70,15 @@ void init(string cmd, string fname, string region, int *nfiles, vector<FILE*> *f
   }
 
 void findcover(int argc, char **argv) {
-  if(argc != 2) printf("Usage: findcover <mindepth> <minlength>\n"
+  if(argc != 3) printf("Usage: findcover <mindepth> <minlength> <arguments to \'samtools depth\'>\n"
 "The output will be a list of regions that are at least <minlength> long and in which each base pair is covered by at least <mindepth> reads.\n"
-"The first column is the starting posision of each region, the second column is the ending position and the third column is the length of the region.\n"), exit(1);
+"The first column is the starting posision of each region, the second column is the ending position and the third column is the length of the region.\n"
+"If you don't want to give any extra arguments to mpileup, write '\"\"'\n"), exit(1);
   int mindepth = atoi(argv[0]), minlen = atoi(argv[1]);
   if(mindepth <= 0) error(1, 0, "mindepth must be greater than zero");
   int nfiles;
   vector <FILE*> files;
-  init("depth", fname, region, &nfiles, &files);
+  init(string("depth ")+argv[2], fname, region, &nfiles, &files);
 
   int poss[nfiles]; //last read position
   mset(poss, 0);
